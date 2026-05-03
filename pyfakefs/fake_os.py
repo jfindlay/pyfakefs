@@ -23,6 +23,7 @@ import functools
 import inspect
 import os
 import sys
+import threading
 import uuid
 from contextlib import contextmanager
 from stat import (
@@ -73,6 +74,12 @@ if TYPE_CHECKING:
 
 NR_STD_STREAMS = 3
 
+# Per-thread state for FakeOsModule.  `use_original` is a per-call
+# configuration switch: when True the decorated methods pass through to the
+# real `os` module.  Storing it in a thread-local prevents cross-thread
+# bleed when multiple threads enter/exit `use_original_os()` concurrently.
+_thread_state: threading.local = threading.local()
+
 
 class FakeOsModule:
     """Uses FakeFilesystem to provide a fake os module replacement.
@@ -88,7 +95,17 @@ class FakeOsModule:
         my_os_module = fake_os.FakeOsModule(filesystem)
     """
 
-    use_original = False
+    @property
+    def use_original(self) -> bool:
+        """Per-thread flag; when True all faked OS calls pass through to
+        the real `os` module.  Backed by `_thread_state` so that
+        concurrent threads do not interfere with each other.
+        """
+        return getattr(_thread_state, "use_original", False)
+
+    @use_original.setter
+    def use_original(self, value: bool) -> None:
+        _thread_state.use_original = value
 
     @staticmethod
     def dir() -> list[str]:
@@ -1468,7 +1485,7 @@ def handle_original_call(f: Callable) -> Callable:
 
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
-        should_use_original = FakeOsModule.use_original
+        should_use_original = getattr(_thread_state, "use_original", False)
 
         if not should_use_original and args:
             self = args[0]
@@ -1501,9 +1518,15 @@ for name, fn in inspect.getmembers(FakeOsModule, inspect.isfunction):
 def use_original_os():
     """Temporarily use original os functions instead of faked ones.
     Used to ensure that skipped modules do not use faked calls.
+
+    `use_original` is stored in a `threading.local` so that concurrent
+    threads entering or leaving this context manager do not interfere with
+    each other.  The previous per-thread value is saved and restored so
+    that nested calls work correctly.
     """
+    prev = getattr(_thread_state, "use_original", False)
     try:
-        FakeOsModule.use_original = True
+        _thread_state.use_original = True
         yield
     finally:
-        FakeOsModule.use_original = False
+        _thread_state.use_original = prev
