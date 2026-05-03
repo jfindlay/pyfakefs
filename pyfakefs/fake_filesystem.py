@@ -419,7 +419,12 @@ class FakeFilesystem:
     @property
     def root_dir(self) -> FakeDirectory:
         """Return the root directory, which represents "/" under POSIX,
-        and the current drive under Windows."""
+        and the current drive under Windows.
+
+        Note:
+            The returned `FakeDirectory` is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
+        """
         if self.is_windows_fs:
             return self._mount_point_dir_for_cwd()
         return self.root
@@ -486,6 +491,29 @@ class FakeFilesystem:
             yield
         finally:
             self.fs_type = old_fs_type
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Re-entrant lock guarding all `FakeFilesystem` state.
+
+        Callers that hold direct references to `FakeFile` or `FakeDirectory`
+        objects (typically obtained from `get_object()`, `lresolve()`,
+        `resolve()`, `root_dir`, `add_real_file()`, `create_file()`,
+        `create_dir()`, or `create_symlink()`) and mutate those objects'
+        attributes from multiple threads must wrap the mutation in
+        `with fs.lock():` to serialise against pyfakefs's internal
+        locking::
+
+            with fs.lock():
+                f = fs.get_object('/foo/bar')
+                f.contents = 'new value'
+
+        Internal callers acquire the same lock via the `_with_lock`
+        decorator applied to every public `FakeFilesystem` method, so
+        nested acquisition is safe (the lock is an `RLock`).
+        """
+        with self._lock:
+            yield
 
     def _add_root_mount_point(self, total_size):
         mount_point = "C:" if self.is_windows_fs else self.path_separator
@@ -1889,6 +1917,10 @@ class FakeFilesystem:
 
         Raises:
             OSError: if the object is not found.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         return self._get_object(file_path, check_read_perm=False, check_exe_perm=False)
 
@@ -1921,6 +1953,10 @@ class FakeFilesystem:
 
         Raises:
             OSError: if the object is not found.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         if isinstance(file_path, int):
             if allow_fd:
@@ -1952,6 +1988,10 @@ class FakeFilesystem:
 
         Raises:
             OSError: if the object is not found.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         path_str = make_string_path(path)
         if not path_str:
@@ -2279,6 +2319,10 @@ class FakeFilesystem:
 
         Raises:
             OSError: if the directory already exists.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         dir_path = self.make_string_path(directory_path)
         dir_path = self.absnormpath(dir_path)
@@ -2357,6 +2401,10 @@ class FakeFilesystem:
         Raises:
             OSError: if the file already exists.
             OSError: if the containing directory is required and missing.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         return self.create_file_internally(
             file_path,
@@ -2400,6 +2448,10 @@ class FakeFilesystem:
             update both the real and fake files' `atime` (access time).
             In this particular case, `add_real_file()` violates the rule
             that `pyfakefs` must not modify the real file system.
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         target_path = target_path or source_path
         source_path_str = make_string_path(source_path)
@@ -2731,6 +2783,10 @@ class FakeFilesystem:
         Raises:
             OSError: if the symlink could not be created
                 (see :py:meth:`create_file`).
+
+        Note:
+            The returned object is a live reference.  Mutating its
+            attributes from multiple threads requires `with fs.lock():`.
         """
         link_path = self.make_string_path(file_path)
         link_target_path = self.make_string_path(link_target)

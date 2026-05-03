@@ -858,7 +858,7 @@ class FakeFileWrapper:
         """Return the FakeFile object that is wrapped by the current instance.
 
         Internal use only; valid only while the caller holds
-        ``self.filesystem._lock``.
+        `self.filesystem._lock`.
         """
         with self.filesystem._lock:
             return self.file_object
@@ -880,7 +880,7 @@ class FakeFileWrapper:
             self._close_fd_locked(fd)
 
     def _close_fd_locked(self, fd: int | None) -> None:
-        """Body of :meth:`close_fd`; executed with ``self.filesystem._lock`` held."""
+        """Body of `close_fd()`; executed with `self.filesystem._lock` held."""
 
         # ignore closing a closed file
         if not self._is_open():

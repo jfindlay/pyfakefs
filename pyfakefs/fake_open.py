@@ -206,7 +206,7 @@ class FakeFileOpen:
         opener: Any = None,
         open_modes: _OpenModes | None = None,
     ) -> AnyFileWrapper:
-        """Body of :meth:`call`; executed with ``self.filesystem._lock`` held."""
+        """Body of `call()`; executed with `self.filesystem._lock` held."""
         binary = "b" in mode
 
         if binary and encoding:

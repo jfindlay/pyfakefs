@@ -42,6 +42,28 @@ provides some additional features:
 - configuration to behave as if running as a non-root user while running
   under root
 
+## Thread safety
+pyfakefs is thread-safe for code that uses the public APIs (`os.*` syscalls,
+`open()`, `pathlib.Path`, `FakeFilesystem.create_file()`, etc.) — every public
+call acquires an internal lock and serialises against concurrent access.  The
+lock is coarser than a real filesystem's; pyfakefs serialises operations on
+independent inodes that a real filesystem would parallelise.  For correctness
+testing this is fine; for tests that depend on real-filesystem concurrency
+semantics, use a real filesystem.
+
+If your test code holds direct references to `FakeFile` or `FakeDirectory`
+objects (typically obtained from `fs.get_object()`, `fs.create_file()`, or
+similar) and mutates their attributes from multiple threads, wrap the mutation
+in `with fs.lock():` to serialise against pyfakefs's internal locking:
+
+```python
+with fs.lock():
+    f = fs.get_object('/foo/bar')
+    f.set_contents('new value')
+```
+
+Use one `Patcher` per test — don't share a `Patcher` across threads.
+
 ## Limitations
 pyfakefs will not work with Python libraries that use C libraries to access the
 file system. This is because pyfakefs cannot patch the underlying C libraries'
