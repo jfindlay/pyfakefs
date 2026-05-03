@@ -593,7 +593,11 @@ if sys.platform == "win32":
 def handle_original_call(f: Callable) -> Callable:
     """Decorator used for real pathlib Path methods to ensure that
     real os functions instead of faked ones are used.
-    Applied to all non-private methods of `FakePathModule`."""
+    Applied to all non-private methods of ``FakePathModule``.
+
+    The lock on ``self.filesystem`` is acquired only for fake calls so that
+    real-OS passthrough calls do not hold the fake-FS lock.
+    """
 
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
@@ -613,6 +617,11 @@ def handle_original_call(f: Callable) -> Callable:
                 if args and isinstance(args[0], FakePathModule):
                     args = args[1:]
                 return getattr(os.path, f.__name__)(*args, **kwargs)
+
+            # Acquire the filesystem lock only for fake calls.
+            if isinstance(args[0], FakePathModule):
+                with args[0].filesystem._lock:
+                    return f(*args, **kwargs)
 
         return f(*args, **kwargs)
 

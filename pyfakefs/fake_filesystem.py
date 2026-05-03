@@ -86,11 +86,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import functools
 import heapq
+import inspect
 import os
 import random
 import sys
 import tempfile
+import threading
 import weakref
 from collections import namedtuple, OrderedDict
 from doctest import TestResults
@@ -232,6 +235,15 @@ class FakeFilesystem:
         )
         self.create_temp_dir = create_temp_dir
 
+        # Reentrant lock serialising all access to filesystem state.
+        # Guards: entries dicts on FakeFile/FakeDirectory nodes, open_files list,
+        # _free_fd_heap, mount_points dict, last_ino/last_dev/used_size counters,
+        # and FakeFile/FakeDirectory attributes accessed via faked-module APIs
+        # (covered transitively once commit 2 wraps faked-module entry points).
+        # RLock (not Lock) because public FakeFilesystem methods call each other;
+        # a non-reentrant lock would deadlock on those nested acquisitions.
+        self._lock: threading.RLock = threading.RLock()
+
         # is_windows_fs can be used to test the behavior of pyfakefs under
         # Windows fs on non-Windows systems and vice verse;
         # is it used to support drive letters, UNC paths and some other
@@ -281,16 +293,29 @@ class FakeFilesystem:
         self.shuffle_listdir_results = True
 
     def __getstate__(self):
-        """Handle weakref to allow pickling of the patcher"""
+        """Handle weakref to allow pickling of the patcher.
+
+        Returns a shallow `__dict__` copy with the weakref resolved.  The `_lock`
+        attribute is excluded because `threading.RLock` is not picklable; `__setstate__`
+        creates a fresh lock on unpickle.
+
+        Note: pickling a live `FakeFilesystem` mid-test is exotic and outside the
+        thread-safety retrofit scope; the caller is responsible for ensuring no concurrent
+        access during pickle/unpickle.
+        """
         s = self.__dict__.copy()
         p = s["_patcher"]
         s["_patcher"] = p() if p is not None else None
+        # RLock is not picklable; recreated in __setstate__.
+        del s["_lock"]
         return s
 
     def __setstate__(self, state):
         self.__dict__ = state.copy()
         p = self.__dict__["_patcher"]
         self.__dict__["_patcher"] = weakref.ref(p) if p is not None else None
+        # Recreate the lock that was stripped in __getstate__.
+        self.__dict__["_lock"] = threading.RLock()
 
     @property
     def has_patcher(self) -> bool:
@@ -298,6 +323,11 @@ class FakeFilesystem:
 
     @property
     def patcher(self) -> Patcher:
+        """Return the Patcher that created this filesystem.
+
+        Access to the returned Patcher's class-level state is serialised by
+        `Patcher._class_lock`.
+        """
         assert self._patcher is not None
         p = self._patcher()
         assert p is not None
@@ -573,10 +603,12 @@ class FakeFilesystem:
                 and path.lower() == matching_string(path, mount_point.lower())
             ):
                 if can_exist:
-                    return self.mount_points[mount_point]
+                    # Return a copy so callers cannot hold a live reference that
+                    # escapes the lock; internal mutation goes through _mount_point_for_path.
+                    return dict(self.mount_points[mount_point])
                 self.raise_os_error(errno.EEXIST, path)
 
-        self.last_dev += 1
+        self.last_dev += 1  # thread_safe_ok: inside _with_lock decorator (commit 1)
         self.mount_points[path] = {
             "idev": self.last_dev,
             "total_size": total_size,
@@ -585,12 +617,13 @@ class FakeFilesystem:
         if path == matching_string(path, self.root.name):
             # special handling for root path: has been created before
             root_dir = self.root
-            self.last_ino += 1
+            self.last_ino += 1  # thread_safe_ok: inside _with_lock decorator (commit 1)
             root_dir.st_ino = self.last_ino
         else:
             root_dir = self._create_mount_point_dir(path)
         root_dir.st_dev = self.last_dev
-        return self.mount_points[path]
+        # Return a copy so callers cannot hold a live reference that escapes the lock.
+        return dict(self.mount_points[path])
 
     def _create_mount_point_dir(self, directory_path: AnyPath) -> FakeDirectory:
         """A version of `create_dir` for the mount point directory creation,
@@ -999,7 +1032,8 @@ class FakeFilesystem:
             raise TypeError("an integer is required")
         valid = file_des < len(self.open_files)
         if valid:
-            return self.open_files[file_des] or []
+            # Return a copy so callers cannot hold a live reference that escapes the lock.
+            return list(self.open_files[file_des]) if self.open_files[file_des] else []
         self.raise_os_error(errno.EBADF, str(file_des))
 
     def has_open_file(self, file_object: FakeFile) -> bool:
@@ -3292,6 +3326,27 @@ class FakeFilesystem:
             # reset the used size to 0 to avoid having the link size counted
             # which would make disk size tests more complicated
             next(iter(self.mount_points.values()))["used_size"] = 0
+
+
+def _with_lock(f: Callable) -> Callable:
+    """Wrap a `FakeFilesystem` method so it acquires `self._lock` on entry.
+
+    Applied to every public method of `FakeFilesystem` via the
+    `inspect.getmembers` loop below.  The lock is reentrant (`RLock`), so
+    nested calls between public methods are safe.
+    """
+
+    @functools.wraps(f)
+    def _locked(self, *args, **kwargs):
+        with self._lock:
+            return f(self, *args, **kwargs)
+
+    return _locked
+
+
+for _name, _fn in inspect.getmembers(FakeFilesystem, inspect.isfunction):
+    if not _fn.__name__.startswith("_"):
+        setattr(FakeFilesystem, _name, _with_lock(_fn))
 
 
 def _run_doctest() -> TestResults:

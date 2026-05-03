@@ -189,6 +189,24 @@ class FakeFileOpen:
                 - if permission is denied
             ValueError: for an invalid mode or mode combination
         """
+        with self.filesystem._lock:
+            return self._call_locked(
+                file_, mode, buffering, encoding, errors, newline, closefd, opener, open_modes
+            )
+
+    def _call_locked(
+        self,
+        file_: AnyStr | int,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+        closefd: bool = True,
+        opener: Any = None,
+        open_modes: _OpenModes | None = None,
+    ) -> AnyFileWrapper:
+        """Body of :meth:`call`; executed with ``self.filesystem._lock`` held."""
         binary = "b" in mode
 
         if binary and encoding:

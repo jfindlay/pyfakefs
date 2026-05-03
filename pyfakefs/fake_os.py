@@ -1481,7 +1481,11 @@ class FakeOsModule:
 def handle_original_call(f: Callable) -> Callable:
     """Decorator used for real pathlib Path methods to ensure that
     real os functions instead of faked ones are used.
-    Applied to all non-private methods of `FakeOsModule`."""
+    Applied to all non-private methods of `FakeOsModule`.
+
+    The lock on `self.filesystem` is acquired only for fake calls so that
+    real-OS passthrough calls do not hold the fake-FS lock.
+    """
 
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
@@ -1504,6 +1508,10 @@ def handle_original_call(f: Callable) -> Callable:
                 args = args[1:]
             return getattr(os, f.__name__)(*args, **kwargs)
 
+        # Acquire the filesystem lock only for fake calls.
+        if args and isinstance(args[0], FakeOsModule):
+            with args[0].filesystem._lock:
+                return f(*args, **kwargs)
         return f(*args, **kwargs)
 
     return wrapped

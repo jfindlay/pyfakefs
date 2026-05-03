@@ -898,6 +898,32 @@ class FakePath(pathlib.Path):
                     pathlib_os._sendfile = old_sendfile
 
 
+def _with_filesystem_lock(f: Callable) -> Callable:
+    """Wrap a `FakePath` method to acquire `cls.filesystem._lock` on entry.
+
+    Applied to public methods overridden by `FakePath`.  Methods that
+    delegate to `fake_open` or `FakeFilesystem` methods acquire the lock
+    transitively through those entry points, so re-acquisition via the
+    `RLock` is safe and produces correct coverage.
+    """
+
+    @functools.wraps(f)
+    def _locked(self, *args, **kwargs):
+        with self.filesystem._lock:
+            return f(self, *args, **kwargs)
+
+    return _locked
+
+
+for _name, _fn in inspect.getmembers(FakePath, inspect.isfunction):
+    # Only wrap methods defined directly on FakePath, not inherited pathlib methods.
+    if _fn.__name__.startswith("_"):
+        continue
+    if _name not in FakePath.__dict__:
+        continue
+    setattr(FakePath, _name, _with_filesystem_lock(_fn))
+
+
 def _warn_is_reserved_deprecated():
     if sys.version_info >= (3, 13):
         warnings.warn(

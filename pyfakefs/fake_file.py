@@ -518,7 +518,7 @@ class FakeDirectory(FakeFile):
         FakeFile.__init__(self, name, S_IFDIR | perm_bits, "", filesystem=filesystem)
         # directories have the link count of contained entries,
         # including '.' and '..'
-        self.st_nlink += 1
+        self.st_nlink += 1  # thread_safe_ok: faked-module lock acquired in commit 2
         self._entries: dict[str, AnyFile] = {}
 
     def set_contents(self, contents: AnyStr, encoding: str | None = None) -> bool:
@@ -563,10 +563,10 @@ class FakeDirectory(FakeFile):
         self._entries[path_object_name] = path_object
         path_object.parent_dir = weakref.ref(self)
         if path_object.st_ino is None:
-            self.filesystem.last_ino += 1
+            self.filesystem.last_ino += 1  # thread_safe_ok: faked-module lock acquired in commit 2
             path_object.st_ino = self.filesystem.last_ino
-        self.st_nlink += 1
-        path_object.st_nlink += 1
+        self.st_nlink += 1  # thread_safe_ok: faked-module lock acquired in commit 2
+        path_object.st_nlink += 1  # thread_safe_ok: faked-module lock acquired in commit 2
         path_object.st_dev = self.st_dev
         if path_object.st_nlink == 1:
             self.filesystem.change_disk_usage(
@@ -639,8 +639,8 @@ class FakeDirectory(FakeFile):
         elif entry.st_nlink == 1:
             self.filesystem.change_disk_usage(-entry.size, pathname_name, entry.st_dev)
 
-        self.st_nlink -= 1
-        entry.st_nlink -= 1
+        self.st_nlink -= 1  # thread_safe_ok: faked-module lock acquired in commit 2
+        entry.st_nlink -= 1  # thread_safe_ok: faked-module lock acquired in commit 2
         assert entry.st_nlink >= 0
 
         del self.entries[to_string(pathname_name)]
@@ -855,10 +855,13 @@ class FakeFileWrapper:
         raise io.UnsupportedOperation(message)
 
     def get_object(self) -> FakeFile:
-        """Return the FakeFile object that is wrapped
-        by the current instance.
+        """Return the FakeFile object that is wrapped by the current instance.
+
+        Internal use only; valid only while the caller holds
+        ``self.filesystem._lock``.
         """
-        return self.file_object
+        with self.filesystem._lock:
+            return self.file_object
 
     def fileno(self) -> int:
         """Return the file descriptor of the file object."""
@@ -868,10 +871,16 @@ class FakeFileWrapper:
 
     def close(self) -> None:
         """Close the file."""
-        self.close_fd(self.filedes)
+        with self.filesystem._lock:
+            self._close_fd_locked(self.filedes)
 
     def close_fd(self, fd: int | None) -> None:
         """Close the file for the given file descriptor."""
+        with self.filesystem._lock:
+            self._close_fd_locked(fd)
+
+    def _close_fd_locked(self, fd: int | None) -> None:
+        """Body of :meth:`close_fd`; executed with ``self.filesystem._lock`` held."""
 
         # ignore closing a closed file
         if not self._is_open():
@@ -944,41 +953,42 @@ class FakeFileWrapper:
 
     def flush(self) -> None:
         """Flush file contents to 'disk'."""
-        if self.is_stream:
-            return
+        with self.filesystem._lock:
+            if self.is_stream:
+                return
 
-        self._check_open_file()
+            self._check_open_file()
 
-        if self.allow_update:
-            if self.open_modes.append:
-                contents = self._io.getvalue()
-                self._sync_io()
-                old_contents = self.file_object.byte_contents
-                assert old_contents is not None
-                contents = old_contents + contents[self._flush_pos :]
-                self._set_stream_contents(contents)
-            else:
-                self._io.flush()
-                contents = self._io.getvalue()
-            changed = self.file_object.set_contents(contents, self._encoding)
-            self.update_flush_pos()
-            if changed:
-                if self.filesystem.is_windows_fs:
-                    self._changed = True
+            if self.allow_update:
+                if self.open_modes.append:
+                    contents = self._io.getvalue()
+                    self._sync_io()
+                    old_contents = self.file_object.byte_contents
+                    assert old_contents is not None
+                    contents = old_contents + contents[self._flush_pos :]
+                    self._set_stream_contents(contents)
                 else:
-                    current_time = helpers.now()
-                    self.file_object.st_ctime = current_time
-                    self.file_object.st_mtime = current_time
-            self._file_epoch = self.file_object.epoch
-            self._flush_related_files()
-        else:
-            buf_length = len(self._io.getvalue())
-            content_length = 0
-            if self.file_object.byte_contents is not None:
-                content_length = len(self.file_object.byte_contents)
-            # an error is only raised if there is something to flush
-            if content_length != buf_length:
-                self.filesystem.raise_os_error(errno.EBADF)
+                    self._io.flush()
+                    contents = self._io.getvalue()
+                changed = self.file_object.set_contents(contents, self._encoding)
+                self.update_flush_pos()
+                if changed:
+                    if self.filesystem.is_windows_fs:
+                        self._changed = True
+                    else:
+                        current_time = helpers.now()
+                        self.file_object.st_ctime = current_time
+                        self.file_object.st_mtime = current_time
+                self._file_epoch = self.file_object.epoch
+                self._flush_related_files()
+            else:
+                buf_length = len(self._io.getvalue())
+                content_length = 0
+                if self.file_object.byte_contents is not None:
+                    content_length = len(self.file_object.byte_contents)
+                # an error is only raised if there is something to flush
+                if content_length != buf_length:
+                    self.filesystem.raise_os_error(errno.EBADF)
 
     def update_flush_pos(self) -> None:
         self._flush_pos = self._io.tell()
@@ -997,15 +1007,16 @@ class FakeFileWrapper:
 
     def seek(self, offset: int, whence: int = 0) -> int:
         """Move read/write pointer in 'file'."""
-        self._check_open_file()
-        if not self.open_modes.append:
-            self._io.seek(offset, whence)
-        else:
-            self._read_seek = offset
-            self._read_whence = whence
-        if not self.is_stream:
-            self.flush()
-        return self.tell()
+        with self.filesystem._lock:
+            self._check_open_file()
+            if not self.open_modes.append:
+                self._io.seek(offset, whence)
+            else:
+                self._read_seek = offset
+                self._read_whence = whence
+            if not self.is_stream:
+                self.flush()
+            return self.tell()
 
     def tell(self) -> int:
         """Return the file's current position.
@@ -1013,19 +1024,20 @@ class FakeFileWrapper:
         Returns:
           int, file's current position in bytes.
         """
-        self._check_open_file()
-        if not self.is_stream:
-            self.flush()
+        with self.filesystem._lock:
+            self._check_open_file()
+            if not self.is_stream:
+                self.flush()
 
-        if not self.open_modes.append:
-            return self._io.tell()
-        if self._read_whence:
-            write_seek = self._io.tell()
-            self._io.seek(self._read_seek, self._read_whence)
-            self._read_seek = self._io.tell()
-            self._read_whence = 0
-            self._io.seek(write_seek)
-        return self._read_seek
+            if not self.open_modes.append:
+                return self._io.tell()
+            if self._read_whence:
+                write_seek = self._io.tell()
+                self._io.seek(self._read_seek, self._read_whence)
+                self._read_seek = self._io.tell()
+                self._read_whence = 0
+                self._io.seek(write_seek)
+            return self._read_seek
 
     def readable(self) -> bool:
         """Returns the readable state of the file."""
@@ -1250,7 +1262,17 @@ class FakeFileWrapper:
         if writing:
             return self._write_wrapper(name)
 
-        return getattr(self._io, name)
+        # Wrap the proxied IO method in a lock-acquiring closure so that each
+        # call acquires filesystem._lock.  This covers read/readline/readlines/
+        # write/writelines and any other method delegated to self._io.
+        underlying = getattr(self._io, name)
+        lock = self.filesystem._lock
+
+        def _locked_io(*args, **kwargs):
+            with lock:
+                return underlying(*args, **kwargs)
+
+        return _locked_io
 
     def _read_error(self) -> Callable:
         def read_error(*args, **kwargs):
@@ -1284,14 +1306,16 @@ class FakeFileWrapper:
             raise ValueError("I/O operation on closed file")
 
     def __iter__(self) -> Iterator[str] | Iterator[bytes]:
-        if not self.readable():
-            self._raise("File is not open for reading")
-        return self._io.__iter__()  # type: ignore[return-value]
+        with self.filesystem._lock:
+            if not self.readable():
+                self._raise("File is not open for reading")
+            return self._io.__iter__()  # type: ignore[return-value]
 
     def __next__(self):
-        if not self.readable():
-            self._raise("File is not open for reading")
-        return next(self._io)
+        with self.filesystem._lock:
+            if not self.readable():
+                self._raise("File is not open for reading")
+            return next(self._io)
 
 
 class FakeTextFileWrapper(FakeFileWrapper, io.TextIOBase):  # type: ignore[misc]

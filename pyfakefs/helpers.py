@@ -59,11 +59,11 @@ _OpenModes = namedtuple(
 
 if sys.platform == "win32":
     fake_id = 0 if ctypes.windll.shell32.IsUserAnAdmin() else 1
-    USER_ID = fake_id
-    GROUP_ID = fake_id
+    USER_ID = fake_id  # thread_safe_ok: module-level init; converted to thread-local in commit 4
+    GROUP_ID = fake_id  # thread_safe_ok: module-level init; converted to thread-local in commit 4
 else:
-    USER_ID = os.getuid()
-    GROUP_ID = os.getgid()
+    USER_ID = os.getuid()  # thread_safe_ok: module-level init; converted to thread-local in commit 4
+    GROUP_ID = os.getgid()  # thread_safe_ok: module-level init; converted to thread-local in commit 4
 
 
 def get_uid() -> int:
@@ -80,7 +80,7 @@ def set_uid(uid: int) -> None:
         uid: (int) the user ID of the user calling the file system functions.
     """
     global USER_ID
-    USER_ID = uid
+    USER_ID = uid  # thread_safe_ok: converted to thread-local in commit 4
 
 
 def get_gid() -> int:
@@ -96,7 +96,7 @@ def set_gid(gid: int) -> None:
         gid: (int) the group ID of the user calling the file system functions.
     """
     global GROUP_ID
-    GROUP_ID = gid
+    GROUP_ID = gid  # thread_safe_ok: converted to thread-local in commit 4
 
 
 def reset_ids() -> None:

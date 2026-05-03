@@ -165,13 +165,16 @@ class ScanDirIter:
         return self
 
     def __next__(self):
+        # Acquire the lock for the duration of the per-entry isdir/islink queries
+        # so that the DirEntry snapshot is internally consistent.
         entry = self.entry_iter.__next__()
-        dir_entry = DirEntry(self.filesystem)
-        dir_entry.name = entry
-        dir_entry.path = self.filesystem.joinpaths(self.path, dir_entry.name)
-        dir_entry._abspath = self.filesystem.joinpaths(self.abspath, dir_entry.name)
-        dir_entry._isdir = self.filesystem.isdir(dir_entry._abspath)
-        dir_entry._islink = self.filesystem.islink(dir_entry._abspath)
+        with self.filesystem._lock:
+            dir_entry = DirEntry(self.filesystem)
+            dir_entry.name = entry
+            dir_entry.path = self.filesystem.joinpaths(self.path, dir_entry.name)
+            dir_entry._abspath = self.filesystem.joinpaths(self.abspath, dir_entry.name)
+            dir_entry._isdir = self.filesystem.isdir(dir_entry._abspath)
+            dir_entry._islink = self.filesystem.islink(dir_entry._abspath)
         return dir_entry
 
     def __enter__(self):
@@ -252,7 +255,12 @@ def walk(filesystem, top, topdown=True, onerror=None, followlinks=False):
         if not top_most and not followlinks and filesystem.islink(top_dir):
             return
         try:
-            top_contents = _classify_directory_contents(filesystem, top_dir)
+            # Snapshot the directory contents atomically under the lock so that
+            # concurrent mutation does not produce partially-classified results.
+            # The yield (and any recursion) happens outside the lock so that
+            # other threads can proceed between directory steps.
+            with filesystem._lock:
+                top_contents = _classify_directory_contents(filesystem, top_dir)
         except OSError as exc:
             top_contents = None
             if onerror is not None:
