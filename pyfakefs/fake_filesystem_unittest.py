@@ -47,6 +47,7 @@ import linecache
 import os
 import sys
 import tempfile
+import threading
 import tokenize
 import unittest
 import warnings
@@ -598,15 +599,22 @@ class Patcher:
     DOC_PATCHER: Optional["Patcher"] = None
     REF_COUNT = 0
     DOC_REF_COUNT = 0
+    # Guards all class-level shared state: PATCHER/DOC_PATCHER singletons,
+    # REF_COUNT/DOC_REF_COUNT, and the five module-cache dicts
+    # (CACHED_MODULES, FS_MODULES, FS_FUNCTIONS, FS_DEFARGS,
+    # SKIPPED_FS_MODULES).  A plain Lock suffices — no internal code path
+    # acquires _class_lock while already holding it.
+    _class_lock: threading.Lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
-        if kwargs.get("is_doc_test", False):
-            if cls.DOC_PATCHER is None:
-                cls.DOC_PATCHER = super().__new__(cls)
-            return cls.DOC_PATCHER
-        if cls.PATCHER is None:
-            cls.PATCHER = super().__new__(cls)
-        return cls.PATCHER
+        with cls._class_lock:  # guards PATCHER/DOC_PATCHER singleton check + assignment
+            if kwargs.get("is_doc_test", False):
+                if cls.DOC_PATCHER is None:
+                    cls.DOC_PATCHER = super().__new__(cls)
+                return cls.DOC_PATCHER
+            if cls.PATCHER is None:
+                cls.PATCHER = super().__new__(cls)
+            return cls.PATCHER
 
     def __init__(
         self,
@@ -763,11 +771,12 @@ class Patcher:
     @classmethod
     def clear_fs_cache(cls) -> None:
         """Clear the module cache."""
-        cls.CACHED_MODULES = set()
-        cls.FS_MODULES = {}
-        cls.FS_FUNCTIONS = {}
-        cls.FS_DEFARGS = []
-        cls.SKIPPED_FS_MODULES = {}
+        with cls._class_lock:  # guards all five cache dicts atomically
+            cls.CACHED_MODULES = set()
+            cls.FS_MODULES = {}
+            cls.FS_FUNCTIONS = {}
+            cls.FS_DEFARGS = []
+            cls.SKIPPED_FS_MODULES = {}
 
     def clear_cache(self) -> None:
         """Clear the module cache (convenience instance method)."""
@@ -941,9 +950,10 @@ class Patcher:
             pass
 
     def _find_def_values(self, module_items: ItemsView[str, FunctionType]) -> None:
-        for _, fct in module_items:
-            for f, i, d in self._def_values(fct):
-                self.__class__.FS_DEFARGS.append((f, i, d))
+        defargs = [(f, i, d) for _, fct in module_items for f, i, d in self._def_values(fct)]
+        if defargs:
+            with self.__class__._class_lock:  # guards FS_DEFARGS write
+                self.__class__.FS_DEFARGS.extend(defargs)
 
     def _find_modules(self) -> None:
         """Find and cache all modules that import file system modules.
@@ -956,7 +966,7 @@ class Patcher:
             try:
                 if (
                     self.use_cache
-                    and module in self.CACHED_MODULES
+                    and module in self.CACHED_MODULES  # optimistic read; benign false-negative
                     or not inspect.ismodule(module)
                 ):
                     continue
@@ -967,7 +977,8 @@ class Patcher:
                 # and any other exception triggered by inspect.ismodule
                 if self.use_cache:
                     try:
-                        self.__class__.CACHED_MODULES.add(module)
+                        with self.__class__._class_lock:  # guards CACHED_MODULES write
+                            self.__class__.CACHED_MODULES.add(module)
                     except TypeError:
                         # unhashable module - don't cache it
                         pass
@@ -984,30 +995,33 @@ class Patcher:
             }
 
             if skipped:
-                for name, mod in modules.items():
-                    self.__class__.SKIPPED_FS_MODULES.setdefault(name, set()).add(
-                        (module, mod.__name__)
-                    )
+                with self.__class__._class_lock:  # guards SKIPPED_FS_MODULES write
+                    for name, mod in modules.items():
+                        self.__class__.SKIPPED_FS_MODULES.setdefault(name, set()).add(
+                            (module, mod.__name__)
+                        )
             else:
-                for name, mod in modules.items():
-                    self.__class__.FS_MODULES.setdefault(name, set()).add(
-                        (module, mod.__name__)
-                    )
                 functions = {
                     name: fct for name, fct in module_items if self._is_fs_function(fct)
                 }
-
-                for name, fct in functions.items():
-                    self.__class__.FS_FUNCTIONS.setdefault(
-                        (name, fct.__name__, fct.__module__), set()
-                    ).add(module)
 
                 # find default arguments that are file system functions
                 if self.patch_default_args:
                     self._find_def_values(module_items)
 
+                with self.__class__._class_lock:  # guards FS_MODULES + FS_FUNCTIONS writes
+                    for name, mod in modules.items():
+                        self.__class__.FS_MODULES.setdefault(name, set()).add(
+                            (module, mod.__name__)
+                        )
+                    for name, fct in functions.items():
+                        self.__class__.FS_FUNCTIONS.setdefault(
+                            (name, fct.__name__, fct.__module__), set()
+                        ).add(module)
+
             if self.use_cache:
-                self.__class__.CACHED_MODULES.add(module)
+                with self.__class__._class_lock:  # guards CACHED_MODULES write
+                    self.__class__.CACHED_MODULES.add(module)
 
     def _refresh(self) -> None:
         """Renew the fake file system and set the _isStale flag to `False`."""
@@ -1036,14 +1050,15 @@ class Patcher:
         """Bind the file-related modules to the :py:mod:`pyfakefs` fake
         modules real ones.  Also bind the fake `file()` and `open()` functions.
         """
-        if self.is_doc_test:
-            self.__class__.DOC_REF_COUNT += 1
-            if self.__class__.DOC_REF_COUNT > 1:
-                return
-        else:
-            self.__class__.REF_COUNT += 1
-            if self.__class__.REF_COUNT > 1:
-                return
+        with self.__class__._class_lock:  # guards REF_COUNT/DOC_REF_COUNT check + increment
+            if self.is_doc_test:
+                self.__class__.DOC_REF_COUNT += 1
+                if self.__class__.DOC_REF_COUNT > 1:
+                    return
+            else:
+                self.__class__.REF_COUNT += 1
+                if self.__class__.REF_COUNT > 1:
+                    return
 
         with warnings.catch_warnings():
             # ignore warnings, see #542 and #614
@@ -1156,21 +1171,23 @@ class Patcher:
 
     def tearDown(self, doctester: Any = None):
         """Clear the fake filesystem bindings created by `setUp()`."""
-        if self.is_doc_test:
-            self.__class__.DOC_REF_COUNT -= 1
-            if self.__class__.DOC_REF_COUNT > 0:
-                return
-        else:
-            self.__class__.REF_COUNT -= 1
-            if self.__class__.REF_COUNT > 0:
-                return
+        with self.__class__._class_lock:  # guards REF_COUNT/DOC_REF_COUNT decrement + PATCHER null-out
+            if self.is_doc_test:
+                self.__class__.DOC_REF_COUNT -= 1
+                if self.__class__.DOC_REF_COUNT > 0:
+                    return
+            else:
+                self.__class__.REF_COUNT -= 1
+                if self.__class__.REF_COUNT > 0:
+                    return
         self.stop_patching()
 
         reset_ids()
-        if self.is_doc_test:
-            self.__class__.DOC_PATCHER = None
-        else:
-            self.__class__.PATCHER = None
+        with self.__class__._class_lock:  # guards PATCHER/DOC_PATCHER null-out
+            if self.is_doc_test:
+                self.__class__.DOC_PATCHER = None
+            else:
+                self.__class__.PATCHER = None
 
     def stop_patching(self, temporary=False) -> None:
         if self._patching:

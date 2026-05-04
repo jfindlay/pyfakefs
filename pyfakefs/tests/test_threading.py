@@ -323,5 +323,157 @@ class TestShape7UidGidNoContamination(unittest.TestCase):
         self.assertEqual(result[0], expected)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Shape 6 — Patcher class-level singleton and ref-count under concurrent access
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestShape6PatcherSingleton(unittest.TestCase):
+    """Shape 6 (THREAD-SAFETY-AUDIT.md): `Patcher.PATCHER`, `REF_COUNT`,
+    and the five module-cache dicts were unprotected class attributes —
+    concurrent `setUp`/`tearDown` from different threads could corrupt the
+    singleton reference or produce a torn ref-count.
+
+    Post-fix: a `threading.Lock` (`Patcher._class_lock`) serialises every
+    read-modify-write on these attributes.
+
+    These tests verify:
+
+    1. N threads calling `Patcher()` concurrently all receive the *same*
+       singleton object (no duplicate instances, no `None` returns).
+    2. N concurrent `setUp` calls leave `REF_COUNT == N` (no lost increments).
+    3. N paired `setUp`/`tearDown` calls leave `REF_COUNT == 0` and
+       `PATCHER == None` after all threads finish (no lost decrements and no
+       stale singleton reference).
+    """
+
+    THREADS = 12
+
+    def setUp(self):
+        # Ensure Patcher class-level state is clean before each test.  We do
+        # this via direct attribute writes — acceptable because we are
+        # deliberately testing the class-level state, not routing through
+        # setUp/tearDown under test.
+        # Note: clear_fs_cache() acquires _class_lock internally; call it
+        # outside any explicit lock block to avoid a non-reentrant deadlock.
+        from pyfakefs.fake_filesystem_unittest import Patcher
+
+        with Patcher._class_lock:
+            Patcher.PATCHER = None
+            Patcher.DOC_PATCHER = None
+            Patcher.REF_COUNT = 0
+            Patcher.DOC_REF_COUNT = 0
+        Patcher.clear_fs_cache()
+
+    def tearDown(self):
+        # Restore clean state regardless of what the test left behind.
+        from pyfakefs.fake_filesystem_unittest import Patcher
+
+        with Patcher._class_lock:
+            Patcher.PATCHER = None
+            Patcher.DOC_PATCHER = None
+            Patcher.REF_COUNT = 0
+            Patcher.DOC_REF_COUNT = 0
+        Patcher.clear_fs_cache()
+
+    def test_singleton_invariant_under_concurrent_new(self) -> None:
+        """All threads that call `Patcher()` concurrently must receive the
+        same singleton object and never `None`."""
+        from pyfakefs.fake_filesystem_unittest import Patcher
+
+        results: list[object] = [None] * self.THREADS
+        barrier = threading.Barrier(self.THREADS)
+
+        def worker(tid: int) -> None:
+            barrier.wait()  # maximise concurrency at the __new__ call site
+            results[tid] = Patcher()
+
+        threads = [
+            threading.Thread(target=worker, args=(t,)) for t in range(self.THREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Every result must be the same object as Patcher.PATCHER.
+        singleton = Patcher.PATCHER
+        self.assertIsNotNone(singleton, "PATCHER should not be None after construction")
+        for tid, result in enumerate(results):
+            self.assertIs(
+                result,
+                singleton,
+                f"thread {tid} received a different Patcher instance",
+            )
+
+    def test_ref_count_no_lost_increments(self) -> None:
+        """N concurrent `setUp` calls must leave `REF_COUNT == N`."""
+        from pyfakefs.fake_filesystem_unittest import Patcher
+
+        # Create the singleton first so __init__ runs once outside the timed
+        # window; concurrent setUp calls will all hit the REF_COUNT > 1 fast-
+        # path, which is the check-and-increment we're testing.
+        patcher = Patcher()
+        patcher.setUp()  # REF_COUNT → 1, patching active
+
+        barrier = threading.Barrier(self.THREADS)
+
+        def worker() -> None:
+            barrier.wait()
+            patcher.setUp()
+
+        threads = [threading.Thread(target=worker) for _ in range(self.THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # One initial setUp + THREADS concurrent setUp calls.
+        expected = 1 + self.THREADS
+        self.assertEqual(
+            Patcher.REF_COUNT,
+            expected,
+            f"REF_COUNT={Patcher.REF_COUNT}, expected {expected} — lost increment(s)",
+        )
+
+        # Drain: call tearDown expected times so state is clean for tearDown().
+        for _ in range(expected):
+            patcher.tearDown()
+
+    def test_ref_count_no_lost_decrements(self) -> None:
+        """N paired setUp/tearDown calls must leave REF_COUNT==0 and
+        PATCHER==None after all threads finish."""
+        from pyfakefs.fake_filesystem_unittest import Patcher
+
+        patcher = Patcher()
+        # Prime the ref-count to THREADS so every tearDown hits REF_COUNT > 0
+        # fast-path until the very last one.
+        for _ in range(self.THREADS):
+            patcher.setUp()
+
+        barrier = threading.Barrier(self.THREADS)
+
+        def worker() -> None:
+            barrier.wait()
+            patcher.tearDown()
+
+        threads = [threading.Thread(target=worker) for _ in range(self.THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(
+            Patcher.REF_COUNT,
+            0,
+            f"REF_COUNT={Patcher.REF_COUNT} after {self.THREADS} tearDown calls — "
+            "lost decrement(s) or torn read",
+        )
+        self.assertIsNone(
+            Patcher.PATCHER,
+            "PATCHER should be None after the last tearDown",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

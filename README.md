@@ -66,7 +66,11 @@ with fs.lock():
 has its own user and group identity, so concurrent tests can set different UIDs without
 contaminating each other.
 
-Use one `Patcher` per test — don't share a `Patcher` across threads.
+Use one `Patcher` per test — don't share a `Patcher` across threads.  Concurrent
+`setUp`/`tearDown` calls on separate `Patcher` instances are safe (reference counting is
+serialised by an internal class-level lock), but sharing a single `Patcher` instance
+across multiple threads for `setUp`/`tearDown` sequencing is not coordinated and may
+produce unpredictable results.
 
 ## Limitations
 pyfakefs will not work with Python libraries that use C libraries to access the
