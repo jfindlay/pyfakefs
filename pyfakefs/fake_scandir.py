@@ -153,6 +153,10 @@ class ScanDirIter:
             self.abspath = self.filesystem.absnormpath(path)
             self.path = to_string(path)
         entries = self.filesystem.confirmdir(self.abspath, check_exe_perm=False).entries
+        # tuple(entries) snapshots the dict-keys at construction time (inside the
+        # handle_original_call lock acquired by FakeOsModule.scandir).  Subsequent
+        # __next__ calls iterate the frozen tuple and re-acquire the lock per step
+        # for isdir/islink queries (Pattern B per-step iterator — thread-safe).
         self.entry_iter = iter(tuple(entries))
 
     @property

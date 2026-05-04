@@ -526,7 +526,17 @@ class FakeDirectory(FakeFile):
 
     @property
     def entries(self) -> dict[str, FakeFile]:
-        """Return the list of contained directory entries."""
+        """Return the live internal mapping of entry names to `FakeFile` nodes.
+
+        Warning:
+            The returned dict is the live `_entries` mapping, not a copy.
+            All internal callers operate inside a `with self.filesystem._lock:`
+            context (via `_with_lock` on `FakeFilesystem` methods or
+            `handle_original_call` on `FakeOsModule` methods).  External
+            callers who obtained this `FakeDirectory` from `get_object()`,
+            `create_dir()`, `root_dir`, or similar must wrap any mutation
+            or multi-step iteration in `with fs.lock():` to avoid races.
+        """
         return self._entries
 
     @property
@@ -723,8 +733,18 @@ class FakeDirectoryFromRealDirectory(FakeDirectory):
 
     @property
     def entries(self) -> dict[str, FakeFile]:
-        """Return the list of contained directory entries, loading them
-        if not already loaded."""
+        """Return the live internal mapping of entry names to `FakeFile` nodes,
+        loading entries from the real filesystem on first access.
+
+        Warning:
+            The returned dict is the live `_entries` mapping, not a copy
+            (same hazard as `FakeDirectory.entries`; see that docstring).
+            Additionally, the `contents_read` check-and-set is not atomic:
+            two threads racing on first access may both execute the load
+            block.  The duplicate `add_real_*` calls are idempotent in
+            practice, but callers that require a single-load guarantee should
+            hold `with fs.lock():` across the first access.
+        """
         if not self.contents_read:
             self.contents_read = True
             base = self.path

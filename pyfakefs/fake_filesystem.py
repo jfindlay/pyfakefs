@@ -277,13 +277,19 @@ class FakeFilesystem:
         os.umask(self.umask)
 
         # A list of open file objects. Their position in the list is their
-        # file descriptor number
+        # file descriptor number.
+        # Thread safety: all internal callers access this list through
+        # lock-wrapped public methods (add_open_file, close_open_file, etc.).
+        # Direct external access without `with fs.lock():` is not thread-safe.
         self.open_files: list[list[AnyFileWrapper] | None] = []
         # A heap containing all free positions in self.open_files list
         self._free_fd_heap: list[int] = []
         # last used numbers for inodes (st_ino) and devices (st_dev)
         self.last_ino: int = 0
         self.last_dev: int = 0
+        # Thread safety: all internal callers iterate/mutate this OrderedDict
+        # through lock-wrapped methods.  Direct external access without
+        # `with fs.lock():` is not thread-safe.
         self.mount_points: dict[AnyString, dict] = OrderedDict()
         self.dev_null: Any = None
         self.reset(total_size=total_size, init_pathlib=False)
