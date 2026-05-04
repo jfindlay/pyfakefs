@@ -32,6 +32,8 @@ from pyfakefs.tests import (
     fake_tempfile_test,
     patched_packages_test,
     mox3_stubout_test,
+    test_thread_safety_static,
+    test_threading,
 )
 
 
@@ -56,6 +58,8 @@ class AllTests(unittest.TestSuite):
                 loader.loadTestsFromModule(dynamic_patch_test),
                 loader.loadTestsFromModule(fake_pathlib_test),
                 loader.loadTestsFromModule(patched_packages_test),
+                loader.loadTestsFromModule(test_threading),
+                loader.loadTestsFromModule(test_thread_safety_static),
             ]
         )
         return self
