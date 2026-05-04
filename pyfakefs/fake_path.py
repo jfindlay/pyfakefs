@@ -30,7 +30,6 @@ from typing import (
     Any,
     AnyStr,
     overload,
-    ClassVar,
     TYPE_CHECKING,
 )
 
@@ -63,15 +62,41 @@ class FakePathModule:
 
     `FakePathModule` should *only* be instantiated by `FakeOsModule`.  See the
     :py:class:`FakeDirectory<pyfakefs.fake_os.FakeOsModule>` docstring for details.
+
+    **Thread-safety design note** (Shape 6 in THREAD-SAFETY-AUDIT.md)
+
+    `sep`, `altsep`, `linesep`, `devnull`, and `pathsep` were
+    previously class attributes written by a `@classmethod` `reset()`.
+    That design was a cross-thread hazard: one thread calling `reset()` to
+    switch its `FakeFilesystem` to Windows mode would write `cls.sep = '\\'`
+    and that write was immediately visible to every other thread reading
+    `os.path.sep` through any `FakePathModule` instance, regardless of
+    which `FakeFilesystem` *their* instance was associated with.
+
+    The fix has two parts that reinforce each other:
+
+    1. `sep` etc. are now *properties* backed by per-instance private attrs
+       (`_sep`, `_altsep`, …).  Writing to one instance does not affect
+       any other instance; the class carries no mutable path-separator state.
+
+    2. The getter falls back to `self.filesystem.*` when the backing attr is
+       `_UNSET` (i.e. `reset()` has not been called on this instance).
+       This means executor-spawned worker threads that inherit a
+       `FakePathModule` instance but never call `reset()` still see the
+       correct separator for their filesystem, and OS-type changes made via
+       `FakeFilesystem.os = OSType.WINDOWS` are immediately reflected
+       without a separate `reset()` call.
+
+    `reset()` and the `_UNSET` sentinel exist to support
+    `FakePosixPathModule` and `FakeWindowsPathModule` (used as parsers for
+    `PurePosixPath` / `PureWindowsPath` in Python ≥ 3.12).  Those
+    subclasses need *frozen* type-specific separators regardless of the
+    underlying `FakeFilesystem` OS type; calling `reset(filesystem)` inside
+    a `use_fs_type(FSType.POSIX/WINDOWS)` context captures the right values
+    into the instance backing attrs, overriding the dynamic fallback.
     """
 
     _OS_PATH_COPY: Any = _copy_module(os.path)
-
-    devnull: ClassVar[str] = ""
-    sep: ClassVar[str] = ""
-    altsep: ClassVar[str | None] = None
-    linesep: ClassVar[str] = ""
-    pathsep: ClassVar[str] = ""
 
     @staticmethod
     def dir() -> list[str]:
@@ -106,6 +131,10 @@ class FakePathModule:
             dir_list += ["isjunction", "splitroot"]
         return dir_list
 
+    # Sentinel used by the sep/altsep/linesep/devnull/pathsep properties to
+    # distinguish "no override set" from any legitimate value.
+    _UNSET: Any = object()
+
     def __init__(self, filesystem: FakeFilesystem, os_module: FakeOsModule):
         """Init.
 
@@ -115,15 +144,106 @@ class FakePathModule:
         self.filesystem = filesystem
         self._os_path = self._OS_PATH_COPY
         self._os_path.os = self.os = os_module  # type: ignore[attr-defined]
-        self.reset(filesystem)
+        # Private backing attrs for the path-separator properties.  _UNSET
+        # means "fall through to self.filesystem.*"; any other value is a
+        # fixed override written by reset() or a subclass __init__.
+        self._sep: Any = self._UNSET
+        self._altsep: Any = self._UNSET
+        self._linesep: Any = self._UNSET
+        self._devnull: Any = self._UNSET
+        self._pathsep: Any = self._UNSET
 
-    @classmethod
-    def reset(cls, filesystem: FakeFilesystem) -> None:
-        cls.sep = filesystem.path_separator
-        cls.altsep = filesystem.alternative_path_separator
-        cls.linesep = filesystem.line_separator
-        cls.devnull = filesystem.devnull
-        cls.pathsep = filesystem.pathsep
+    @property
+    def sep(self) -> str:
+        """Path separator.
+
+        Returns the fixed override set by `reset()` (or a subclass
+        `__init__`) if one has been set; otherwise reads dynamically from
+        `self.filesystem.path_separator` so that OS-type changes are
+        immediately visible without a separate `reset()` call.
+
+        The backing attr (`_sep`) is per-instance, so a concurrent thread
+        calling `reset()` on its own `FakePathModule` instance cannot
+        affect this instance's value.  See the class docstring for the full
+        thread-safety rationale and the role of the `_UNSET` sentinel.
+        """
+        v = self._sep
+        return self.filesystem.path_separator if v is self._UNSET else v
+
+    @sep.setter
+    def sep(self, value: str) -> None:
+        self._sep = value
+
+    @property
+    def altsep(self) -> str | None:
+        """Alternative path separator; see `sep`."""
+        v = self._altsep
+        return self.filesystem.alternative_path_separator if v is self._UNSET else v
+
+    @altsep.setter
+    def altsep(self, value: str | None) -> None:
+        self._altsep = value
+
+    @property
+    def linesep(self) -> str:
+        """Line separator; see `sep`."""
+        v = self._linesep
+        return self.filesystem.line_separator if v is self._UNSET else v
+
+    @linesep.setter
+    def linesep(self, value: str) -> None:
+        self._linesep = value
+
+    @property
+    def devnull(self) -> str:
+        """Null device path; see `sep`."""
+        v = self._devnull
+        return self.filesystem.devnull if v is self._UNSET else v
+
+    @devnull.setter
+    def devnull(self, value: str) -> None:
+        self._devnull = value
+
+    @property
+    def pathsep(self) -> str:
+        """Path list separator; see `sep`."""
+        v = self._pathsep
+        return self.filesystem.pathsep if v is self._UNSET else v
+
+    @pathsep.setter
+    def pathsep(self, value: str) -> None:
+        self._pathsep = value
+
+    def reset(self, filesystem: FakeFilesystem) -> None:
+        """Fix path-separator attributes to the values of `filesystem`.
+
+        After this call, `sep`, `altsep`, etc. return the values captured
+        from `filesystem` at call time rather than reading dynamically from
+        `self.filesystem`.  Call with `filesystem.path_separator` matching
+        the desired OS type to freeze the values for a `PurePosixPath` /
+        `PureWindowsPath` parser.
+
+        Writing to per-instance attrs (not class attrs) means that one
+        thread calling `reset` on its own `FakePathModule` does not
+        affect any concurrent thread's `FakePathModule` instance.
+
+        Args:
+            filesystem: the `FakeFilesystem` whose path-separator values
+                are captured into this module's attributes.
+
+        Note:
+            This method was a `@classmethod` in earlier releases and accepted
+            `filesystem` as a positional argument via the class.  The
+            signature changed to an instance method in the thread-safety
+            retrofit; callers using `FakePathModule.reset(filesystem)`
+            (class-level call) must be updated to
+            `path_module_instance.reset(filesystem)`.
+        """
+        self.sep = filesystem.path_separator
+        self.altsep = filesystem.alternative_path_separator
+        self.linesep = filesystem.line_separator
+        self.devnull = filesystem.devnull
+        self.pathsep = filesystem.pathsep
 
     def exists(self, path: AnyStr) -> bool:
         """Determine whether the file object exists within the fake filesystem.
@@ -593,9 +713,9 @@ if sys.platform == "win32":
 def handle_original_call(f: Callable) -> Callable:
     """Decorator used for real pathlib Path methods to ensure that
     real os functions instead of faked ones are used.
-    Applied to all non-private methods of ``FakePathModule``.
+    Applied to all non-private methods of `FakePathModule`.
 
-    The lock on ``self.filesystem`` is acquired only for fake calls so that
+    The lock on `self.filesystem` is acquired only for fake calls so that
     real-OS passthrough calls do not hold the fake-FS lock.
     """
 

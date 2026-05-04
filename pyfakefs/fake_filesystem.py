@@ -352,7 +352,6 @@ class FakeFilesystem:
             if value:
                 self._is_macos = False
             self.reset()
-            FakePathModule.reset(self)
 
     @property
     def is_macos(self) -> bool:
@@ -366,7 +365,6 @@ class FakeFilesystem:
             if value:
                 self._is_windows_fs = False
             self.reset()
-            FakePathModule.reset(self)
 
     @property
     def path_separator(self) -> str:
@@ -462,7 +460,6 @@ class FakeFilesystem:
         )
         self.fs_properties[0] = base_properties
         self.reset()
-        FakePathModule.reset(self)
 
     def reset(self, total_size: int | None = None, init_pathlib: bool = True):
         """Remove all file system contents and reset the root."""
@@ -3415,9 +3412,9 @@ def _run_doctest() -> TestResults:
 def __getattr__(name):
     # backwards compatibility for read access to globals moved to helpers
     if name == "USER_ID":
-        return helpers.USER_ID
+        return helpers.get_uid()
     if name == "GROUP_ID":
-        return helpers.GROUP_ID
+        return helpers.get_gid()
     raise AttributeError(f"No attribute {name!r}.")
 
 

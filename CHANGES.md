@@ -4,6 +4,12 @@ The released versions correspond to PyPI releases.
 
 ## Unreleased
 
+### Breaking changes
+* `FakePathModule.reset()` is now an instance method; it was a
+  `@classmethod` in previous releases.  Any caller using the class-level
+  form `FakePathModule.reset(filesystem)` will receive a `TypeError` and
+  must be updated to call `path_module_instance.reset(filesystem)` instead.
+
 ### Fixes
 * fixed a crash if the stack limit was set to a low value
   (see [#1313](https://github.com/pytest-dev/pyfakefs/issues/1313))

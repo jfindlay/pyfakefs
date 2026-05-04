@@ -229,5 +229,99 @@ class TestFsLockContextManager(unittest.TestCase):
         self.assertIsInstance(internal_lock, type(threading.RLock()))
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Shape 7 — per-thread uid/gid (helpers.py thread-local)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestShape7UidGidNoContamination(unittest.TestCase):
+    """Shape 7 (THREAD-SAFETY-AUDIT.md): `USER_ID` / `GROUP_ID` were plain
+    module globals — a `set_uid()` call in one thread was visible to all
+    concurrent threads performing permission checks.
+
+    Post-fix: each thread has its own uid/gid in a `threading.local`.
+    N threads each set their own uid, then read it back; no cross-thread
+    contamination is allowed.
+    """
+
+    THREADS = 16
+    ITERATIONS = 50
+
+    def test_no_uid_contamination(self) -> None:
+        from pyfakefs import helpers
+
+        errors: list[str] = []
+        error_lock = threading.Lock()
+
+        def worker(tid: int) -> None:
+            uid = 1000 + tid
+            for _ in range(self.ITERATIONS):
+                helpers.set_uid(uid)
+                observed = helpers.get_uid()
+                if observed != uid:
+                    with error_lock:
+                        errors.append(
+                            f"tid={tid}: set_uid({uid}) but get_uid()={observed}"
+                        )
+            # Reset to process default so we don't leak state to subsequent tests.
+            helpers.reset_ids()
+
+        threads = [
+            threading.Thread(target=worker, args=(t,)) for t in range(self.THREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertFalse(errors, "uid contamination detected:\n" + "\n".join(errors))
+
+    def test_no_gid_contamination(self) -> None:
+        from pyfakefs import helpers
+
+        errors: list[str] = []
+        error_lock = threading.Lock()
+
+        def worker(tid: int) -> None:
+            gid = 2000 + tid
+            for _ in range(self.ITERATIONS):
+                helpers.set_gid(gid)
+                observed = helpers.get_gid()
+                if observed != gid:
+                    with error_lock:
+                        errors.append(
+                            f"tid={tid}: set_gid({gid}) but get_gid()={observed}"
+                        )
+            helpers.reset_ids()
+
+        threads = [
+            threading.Thread(target=worker, args=(t,)) for t in range(self.THREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertFalse(errors, "gid contamination detected:\n" + "\n".join(errors))
+
+    def test_default_uid_is_process_uid(self) -> None:
+        """A thread that never calls `set_uid` sees the process default."""
+        import os
+        import sys
+        from pyfakefs import helpers
+
+        result: list[int] = []
+
+        def worker() -> None:
+            # Deliberately do NOT call set_uid — should see process default.
+            result.append(helpers.get_uid())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        expected = 0 if sys.platform == "win32" else os.getuid()
+        self.assertEqual(result[0], expected)
+
+
 if __name__ == "__main__":
     unittest.main()

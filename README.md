@@ -62,6 +62,10 @@ with fs.lock():
     f.set_contents('new value')
 ```
 
+`set_uid()` / `set_gid()` (and the corresponding getters) are per-thread: each test thread
+has its own user and group identity, so concurrent tests can set different UIDs without
+contaminating each other.
+
 Use one `Patcher` per test — don't share a `Patcher` across threads.
 
 ## Limitations

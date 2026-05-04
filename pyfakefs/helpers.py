@@ -22,6 +22,7 @@ import platform
 import stat
 import sys
 import sysconfig
+import threading
 import time
 import traceback
 from collections import namedtuple
@@ -57,50 +58,54 @@ _OpenModes = namedtuple(
     "must_exist can_read can_write truncate append must_not_exist",
 )
 
+# Per-thread state for user/group identity.  USER_ID and GROUP_ID were
+# previously plain module globals, making set_uid()/set_gid() calls in one
+# thread visible to concurrent threads performing permission checks.  Each
+# thread now gets its own uid/gid, defaulting to the process-level values at
+# first read (same semantics as before for single-threaded code).
+_id_thread_state: threading.local = threading.local()
+
 if sys.platform == "win32":
-    fake_id = 0 if ctypes.windll.shell32.IsUserAnAdmin() else 1
-    USER_ID = fake_id  # thread_safe_ok: module-level init; converted to thread-local in commit 4
-    GROUP_ID = fake_id  # thread_safe_ok: module-level init; converted to thread-local in commit 4
+    _DEFAULT_ID: int = 0 if ctypes.windll.shell32.IsUserAnAdmin() else 1
 else:
-    USER_ID = os.getuid()  # thread_safe_ok: module-level init; converted to thread-local in commit 4
-    GROUP_ID = os.getgid()  # thread_safe_ok: module-level init; converted to thread-local in commit 4
+    _DEFAULT_ID = os.getuid()
+
+_DEFAULT_GID: int = 0 if sys.platform == "win32" else os.getgid()
 
 
 def get_uid() -> int:
-    """Get the global user id. Same as ``os.getuid()``"""
-    return USER_ID
+    """Get the current thread's user id. Same as `os.getuid()`."""
+    return getattr(_id_thread_state, "uid", _DEFAULT_ID)
 
 
 def set_uid(uid: int) -> None:
-    """Set the global user id. This is used as st_uid for new files
+    """Set the current thread's user id.  This is used as st_uid for new files
     and to differentiate between a normal user and the root user (uid 0).
     For the root user, some permission restrictions are ignored.
 
     Args:
         uid: (int) the user ID of the user calling the file system functions.
     """
-    global USER_ID
-    USER_ID = uid  # thread_safe_ok: converted to thread-local in commit 4
+    _id_thread_state.uid = uid
 
 
 def get_gid() -> int:
-    """Get the global group id. Same as ``os.getgid()``"""
-    return GROUP_ID
+    """Get the current thread's group id. Same as `os.getgid()`."""
+    return getattr(_id_thread_state, "gid", _DEFAULT_GID)
 
 
 def set_gid(gid: int) -> None:
-    """Set the global group id. This is only used to set st_gid for new files,
-    no permission checks are performed.
+    """Set the current thread's group id.  This is only used to set st_gid for
+    new files; no permission checks are performed.
 
     Args:
         gid: (int) the group ID of the user calling the file system functions.
     """
-    global GROUP_ID
-    GROUP_ID = gid  # thread_safe_ok: converted to thread-local in commit 4
+    _id_thread_state.gid = gid
 
 
 def reset_ids() -> None:
-    """Set the global user ID and group ID back to default values."""
+    """Reset the current thread's user ID and group ID to the process defaults."""
     if sys.platform == "win32":
         reset_id = 0 if ctypes.windll.shell32.IsUserAnAdmin() else 1
         set_uid(reset_id)
@@ -111,8 +116,8 @@ def reset_ids() -> None:
 
 
 def is_root() -> bool:
-    """Return `True` if the current user is the root user."""
-    return USER_ID == 0
+    """Return `True` if the current thread's user is the root user."""
+    return get_uid() == 0
 
 
 def is_int_type(val: Any) -> bool:
